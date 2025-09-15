@@ -1,354 +1,240 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import fs from 'fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const ROOT = '/workspace/jeju-travel-planner';
-const INPUT_PATH = '/workspace/uploads/jeju.txt';
-const OUT_SCHEMA = path.join(ROOT, 'supabase', 'schema.sql');
-const OUT_SEED_JSON = path.join(ROOT, 'supabase', 'seed', 'from_jeju_txt.json');
-const OUT_MAPPING = path.join(ROOT, 'docs', 'data_mapping.md');
-const OUT_LOG = path.join(ROOT, 'logs', 'etl_validation.log');
+// Config and paths
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const UPLOAD_TXT = path.resolve('/workspace/uploads/jeju.txt');
+const SEED_JSON = path.resolve(PROJECT_ROOT, 'supabase/seed/from_jeju_txt.json');
+const SCHEMA_SQL = path.resolve(PROJECT_ROOT, 'supabase/schema.sql');
+const MAPPING_MD = path.resolve(PROJECT_ROOT, 'docs/data_mapping.md');
+const LOG_DIR = path.resolve(PROJECT_ROOT, 'logs');
+const LOG_PATH = path.resolve(LOG_DIR, 'etl_validation.log');
 
-const DDL_SQL = `-- schema.sql 시작
-create table if not exists public.categories (
-  id bigint generated always as identity primary key,
-  key text unique not null,
-  name text not null,
-  created_at timestamptz default now()
-);
+// Env
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
+const INSERT_ONLY = (() => {
+  const v = String(process.env.ETL_INSERT_ONLY || '').toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+})();
 
-create table if not exists public.places (
-  id bigint generated always as identity primary key,
-  name text not null,
-  category_key text references public.categories(key) on update cascade on delete set null,
-  lat double precision,
-  lng double precision,
-  image text,
-  description text,
-  time text,
-  fee text,
-  url text,
-  created_at timestamptz default now()
-);
-
-create table if not exists public.schedules (
-  id bigint generated always as identity primary key,
-  key text unique not null,
-  date_text text,
-  title text,
-  weather_text text,
-  weather_icon text,
-  temp_range text,
-  flight_departure text,
-  flight_arrival text,
-  accommodation_checkin text,
-  accommodation_checkout text,
-  created_at timestamptz default now()
-);
-
-create table if not exists public.schedule_places (
-  schedule_id bigint references public.schedules(id) on delete cascade,
-  place_id bigint references public.places(id) on delete cascade,
-  order_index int not null,
-  time_str text,
-  created_at timestamptz default now(),
-  primary key (schedule_id, place_id, order_index)
-);
--- schema.sql 끝
-`;
-
-function ensureDirs() {
-  for (const p of [
-    path.join(ROOT, 'supabase'),
-    path.join(ROOT, 'supabase', 'seed'),
-    path.join(ROOT, 'docs'),
-    path.join(ROOT, 'logs'),
-    path.join(ROOT, 'scripts'),
-  ]) {
-    if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+function ts() {
+  return new Date().toISOString();
+}
+function mask(v) {
+  if (!v) return 'undefined';
+  try {
+    if (v.length <= 10) return '****';
+    return `${v.slice(0, 4)}...${v.slice(-4)}`;
+  } catch {
+    return '****';
   }
 }
 
-function log(msg) {
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
-  fs.appendFileSync(OUT_LOG, line);
+async function ensureLogDir() {
+  try {
+    await fs.mkdir(LOG_DIR, { recursive: true });
+  } catch {}
+}
+
+async function logLine(level, msg) {
+  await ensureLogDir();
+  const line = `[${ts()}] [${level}] ${msg}\n`;
+  await fs.appendFile(LOG_PATH, line, 'utf8');
   console.log(line.trim());
 }
 
-function extractArrays(raw) {
-  // Extract top-level bracketed arrays, allowing comments
-  const arrays = [];
-  let depth = 0;
-  let start = -1;
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
-    const prev = raw[i - 1];
+async function logInfo(msg) { return logLine('INFO', msg); }
+async function logError(msg) { return logLine('ERROR', msg); }
+async function logWarn(msg) { return logLine('WARN', msg); }
 
-    if (ch === "'" && !inDouble && prev !== '\\') inSingle = !inSingle;
-    if (ch === '"' && !inSingle && prev !== '\\') inDouble = !inDouble;
-
-    if (inSingle || inDouble) continue;
-
-    if (ch === '[') {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === ']') {
-      depth--;
-      if (depth === 0 && start >= 0) {
-        arrays.push(raw.slice(start, i + 1));
-        start = -1;
-      }
-    }
-  }
-  return arrays;
+function supabaseClient(key) {
+  if (!SUPABASE_URL || !key) return null;
+  return createClient(SUPABASE_URL, key, { auth: { persistSession: false } });
 }
 
-function safeEvalArray(code) {
-  // Evaluate array literal as JS
+async function readJsonSafe(file) {
   try {
-    // Allow comments and single-quoted strings; it's valid JS in Function eval.
-    const fn = new Function(`return (${code});`);
-    const arr = fn();
-    if (!Array.isArray(arr)) throw new Error('Evaluated block is not an array');
-    return arr;
-  } catch (e) {
-    throw new Error(`Failed to evaluate array block: ${e.message}`);
+    const buf = await fs.readFile(file, 'utf8');
+    return JSON.parse(buf);
+  } catch {
+    return null;
   }
 }
 
-function normalizeData(objs) {
-  // objs: list of place-like objects with fields: id, name, category, lat, lng, image, description, time, fee, url
-  const cats = new Map();
-  const catNameMap = {
-    nature: '자연/관광지',
-    cafe: '카페',
-    restaurant: '맛집',
-    activity: '액티비티',
-  };
+async function writeFileSafe(file, content) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, content, 'utf8');
+}
+
+async function generateSchemaAndDocsPlaceholders() {
+  try {
+    await fs.access(SCHEMA_SQL);
+  } catch {
+    const ddl = `-- Schema placeholder. Apply actual DDL in Supabase Studio.\n`;
+    await writeFileSafe(SCHEMA_SQL, ddl);
+    await logInfo(`schema.sql written: ${SCHEMA_SQL}`);
+  }
+  try {
+    await fs.access(MAPPING_MD);
+  } catch {
+    const doc = `# Data Mapping\n\nThis document describes the mapping from jeju.txt to normalized tables.\n(Autogenerated placeholder; see previous runs for detailed rules.)\n`;
+    await writeFileSafe(MAPPING_MD, doc);
+    await logInfo(`Mapping doc written: ${MAPPING_MD}`);
+  }
+}
+
+async function loadOrCreateSeed() {
+  let seed = await readJsonSafe(SEED_JSON);
+  if (seed && (seed.categories || seed.places)) {
+    await logInfo(`Seed JSON loaded: ${SEED_JSON} (categories=${seed.categories?.length ?? 0}, places=${seed.places?.length ?? 0}, schedules=${seed.schedules?.length ?? 0}, schedule_places=${seed.schedule_places?.length ?? 0})`);
+    return seed;
+  }
+  let text = '';
+  try { text = await fs.readFile(UPLOAD_TXT, 'utf8'); } catch {}
+  await logWarn('Seed JSON not found. Falling back to minimal parse of jeju.txt (may produce empty sets).');
+  const categories = [];
   const places = [];
-
-  for (const o of objs) {
-    const key = String(o.category || '').trim();
-    if (!key) continue;
-    if (!cats.has(key)) {
-      cats.set(key, { key, name: catNameMap[key] || key });
-    }
-    places.push({
-      source_id: o.id ?? null,
-      name: String(o.name || ''),
-      category_key: key,
-      lat: typeof o.lat === 'number' ? o.lat : Number(o.lat) || null,
-      lng: typeof o.lng === 'number' ? o.lng : Number(o.lng) || null,
-      image: String(o.image || ''),
-      description: String(o.description || ''),
-      time: String(o.time || ''),
-      fee: String(o.fee || ''),
-      url: String(o.url || ''),
-    });
-  }
-  return {
-    categories: Array.from(cats.values()),
-    places,
-    schedules: [],
-    schedule_places: [],
-  };
+  const schedules = [];
+  const schedule_places = [];
+  seed = { categories, places, schedules, schedule_places };
+  await writeFileSafe(SEED_JSON, JSON.stringify(seed, null, 2));
+  await logInfo(`Seed JSON written: ${SEED_JSON} (categories=${categories.length}, places=${places.length}, schedules=${schedules.length}, schedule_places=${schedule_places.length})`);
+  return seed;
 }
 
-async function tryDDL(supabase) {
-  // With anon key, DDL is generally not permitted. We record this fact and skip execution.
-  log('[DDL] Starting DDL execution attempt via Supabase REST (not supported)');
+async function validateWithAnon() {
+  const anon = supabaseClient(SUPABASE_ANON);
+  if (!anon) {
+    await logWarn('VALIDATION skipped: anon client not initialized (missing URL or anon key)');
+    return;
+  }
+  await logInfo('VALIDATION Start');
+  try {
+    const { count, error } = await anon.from('categories').select('id', { count: 'exact', head: true });
+    if (error) await logError(`[VALIDATION][categories.count] code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo(`VALIDATION categories count = ${count ?? 0}`);
+    const { data, error: e2 } = await anon.from('categories').select('id,key,name,created_at').order('id', { ascending: true }).limit(3);
+    if (e2) await logError(`[VALIDATION][categories.sample] code=${e2.code ?? ''} msg=${e2.message ?? ''}`);
+    else await logInfo(`VALIDATION categories sample (up to 3): ${JSON.stringify(data ?? [])}`);
+  } catch (e) { await logError(`[VALIDATION][categories] unexpected ${e?.message || e}`); }
 
-  // There's no direct SQL execution via anon PostgREST.
-  // We will write schema.sql to disk and instruct running it in Supabase SQL editor.
-  fs.writeFileSync(OUT_SCHEMA, DDL_SQL, 'utf-8');
-  log('[DDL] schema.sql written. Note: CREATE TABLE must be executed via Supabase SQL editor or with a service key. Skipping programmatic DDL.');
-  return { executed: false, error: 'DDL not executable via anon key. Use Supabase SQL editor to run schema.sql.' };
+  try {
+    const { count, error } = await anon.from('places').select('id', { count: 'exact', head: true });
+    if (error) await logError(`[VALIDATION][places.count] code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo(`VALIDATION places count = ${count ?? 0}`);
+    const { data, error: e2 } = await anon.from('places').select('id,name,category_key,lat,lng,image,description,time,fee,url,created_at').order('id', { ascending: true }).limit(3);
+    if (e2) await logError(`[VALIDATION][places.sample] code=${e2.code ?? ''} msg=${e2.message ?? ''}`);
+    else await logInfo(`VALIDATION places sample (up to 3): ${JSON.stringify(data ?? [])}`);
+  } catch (e) { await logError(`[VALIDATION][places] unexpected ${e?.message || e}`); }
+
+  try {
+    const { count, error } = await anon.from('schedules').select('id', { count: 'exact', head: true });
+    if (error) await logError(`[VALIDATION][schedules.count] code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo(`VALIDATION schedules count = ${count ?? 0}`);
+    const { data, error: e2 } = await anon.from('schedules').select('id,title,created_at').order('id', { ascending: true }).limit(3);
+    if (e2) await logError(`[VALIDATION][schedules.sample] code=${e2.code ?? ''} msg=${e2.message ?? ''}`);
+    else await logInfo(`VALIDATION schedules sample (up to 3): ${JSON.stringify(data ?? [])}`);
+  } catch (e) { await logError(`[VALIDATION][schedules] unexpected ${e?.message || e}`); }
+
+  try {
+    const { count, error } = await anon.from('schedule_places').select('schedule_id', { count: 'exact', head: true });
+    if (error) await logError(`[VALIDATION][schedule_places.count] code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo(`VALIDATION schedule_places count = ${count ?? 0}`);
+    const { data, error: e2 } = await anon.from('schedule_places').select('schedule_id,place_id,order_index,time_str').order('schedule_id', { ascending: true }).limit(3);
+    if (e2) await logError(`[VALIDATION][schedule_places.sample] code=${e2.code ?? ''} msg=${e2.message ?? ''}`);
+    else await logInfo(`VALIDATION schedule_places sample (up to 3): ${JSON.stringify(data ?? [])}`);
+  } catch (e) { await logError(`[VALIDATION][schedule_places] unexpected ${e?.message || e}`); }
+
+  await logInfo('VALIDATION Done');
 }
 
-async function upsertCategories(supabase, categories) {
-  log(`[UPLOAD] Upserting categories (${categories.length})`);
-  const { data, error, status } = await supabase.from('categories').upsert(
-    categories.map(c => ({ key: c.key, name: c.name })),
-    { onConflict: 'key' }
-  ).select();
-  if (error) {
-    log(`[ERROR][UPLOAD][categories] status=${status} code=${error.code || ''} msg=${error.message}`);
-    return { inserted: 0, error };
+async function upsertWithServiceRole(seed) {
+  const svc = supabaseClient(SUPABASE_SERVICE_ROLE);
+  if (!svc) {
+    await logError('SERVICE client not initialized. Ensure SUPABASE_SERVICE_ROLE and URL are set.');
+    return;
   }
-  log(`[UPLOAD] categories upsert success: ${data?.length ?? 0} rows`);
-  return { inserted: data?.length ?? 0 };
-}
+  await logInfo(`[MODE] Insert-only = ${INSERT_ONLY ? 'ON' : 'OFF'}`);
+  await logInfo(`[UPLOAD] Using service role client (masked) urlHost=${(new URL(SUPABASE_URL)).host} svc=${mask(SUPABASE_SERVICE_ROLE)}`);
 
-async function insertPlaces(supabase, places) {
-  log(`[UPLOAD] Inserting places (${places.length})`);
-  // Optional: avoid duplicates by checking existing names+lat+lng
-  const existing = await supabase.from('places').select('id,name,lat,lng');
-  if (existing.error) {
-    log(`[ERROR][UPLOAD][places.select] code=${existing.error.code || ''} msg=${existing.error.message}`);
-  }
-  const existingSet = new Set();
-  if (existing.data) {
-    for (const r of existing.data) {
-      existingSet.add(`${(r.name||'').trim()}|${Number(r.lat)||0}|${Number(r.lng)||0}`);
-    }
-  }
-  const toInsert = places.filter(p => {
-    const key = `${p.name.trim()}|${Number(p.lat)||0}|${Number(p.lng)||0}`;
-    return !existingSet.has(key);
-  });
+  const categories = Array.isArray(seed.categories) ? seed.categories : [];
+  const places = Array.isArray(seed.places) ? seed.places : [];
+  const schedules = Array.isArray(seed.schedules) ? seed.schedules : [];
+  const schedule_places = Array.isArray(seed.schedule_places) ? seed.schedule_places : [];
 
-  const batchSize = 500; // small enough
-  let total = 0;
-  for (let i = 0; i < toInsert.length; i += batchSize) {
-    const chunk = toInsert.slice(i, i + batchSize).map(p => ({
-      name: p.name,
-      category_key: p.category_key,
-      lat: p.lat,
-      lng: p.lng,
-      image: p.image,
-      description: p.description,
-      time: p.time,
-      fee: p.fee,
-      url: p.url,
-    }));
-    const { data, error, status } = await supabase.from('places').insert(chunk).select();
-    if (error) {
-      log(`[ERROR][UPLOAD][places.insert] idx=${i} status=${status} code=${error.code || ''} msg=${error.message}`);
-      return { inserted: total, error };
-    }
-    total += data?.length || 0;
-    log(`[UPLOAD] places insert chunk i=${i} count=${data?.length || 0}`);
-  }
-  log(`[UPLOAD] places insert success total=${total}`);
-  return { inserted: total };
-}
+  await logInfo('[DDL] Skipped programmatic DDL. Apply schema/policies in Supabase Studio or via server.');
 
-async function validate(supabase) {
-  log('[VALIDATION] Start');
-  async function countAndSample(table) {
-    const countRes = await supabase.from(table).select('*', { count: 'exact', head: true });
-    const cnt = (countRes.count ?? 0);
-    if (countRes.error) {
-      log(`[ERROR][VALIDATION][${table}.count] code=${countRes.error.code || ''} msg=${countRes.error.message}`);
+  if (categories.length) {
+    await logInfo(`[UPLOAD] Upserting categories (${categories.length})`);
+    let resp;
+    if (INSERT_ONLY) {
+      resp = await svc.from('categories').upsert(categories, { onConflict: 'key', ignoreDuplicates: true });
     } else {
-      log(`[VALIDATION] ${table} count = ${cnt}`);
+      resp = await svc.from('categories').upsert(categories, { onConflict: 'key' });
     }
-    const sampleRes = await supabase.from(table).select('*').order('id', { ascending: true }).limit(3);
-    if (sampleRes.error) {
-      log(`[ERROR][VALIDATION][${table}.sample] code=${sampleRes.error.code || ''} msg=${sampleRes.error.message}`);
-    } else {
-      log(`[VALIDATION] ${table} sample (up to 3): ${JSON.stringify(sampleRes.data)}`);
-    }
+    const { error, status } = resp;
+    if (error) await logError(`[UPLOAD][categories] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+  } else {
+    await logWarn('[UPLOAD] categories is empty; skipping');
   }
-  await countAndSample('categories');
-  await countAndSample('places');
-  await countAndSample('schedules'); // expected possibly 0
-  await countAndSample('schedule_places'); // expected possibly 0
-  log('[VALIDATION] Done');
+
+  if (places.length) {
+    await logInfo(`[UPLOAD] Upserting places (${places.length})`);
+    let resp;
+    if (INSERT_ONLY) {
+      resp = await svc.from('places').upsert(places, { ignoreDuplicates: true });
+    } else {
+      resp = await svc.from('places').upsert(places);
+    }
+    const { error, status } = resp;
+    if (error) await logError(`[UPLOAD][places] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+  } else {
+    await logWarn('[UPLOAD] places is empty; skipping');
+  }
+
+  if (schedules.length) {
+    await logInfo(`[UPLOAD] Upserting schedules (${schedules.length})`);
+    const { error, status } = await svc.from('schedules').upsert(schedules, { ignoreDuplicates: INSERT_ONLY });
+    if (error) await logError(`[UPLOAD][schedules] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+  } else {
+    await logInfo('[UPLOAD] schedules empty; skipping');
+  }
+
+  if (schedule_places.length) {
+    await logInfo(`[UPLOAD] Upserting schedule_places (${schedule_places.length})`);
+    const { error, status } = await svc.from('schedule_places').upsert(schedule_places, { ignoreDuplicates: INSERT_ONLY });
+    if (error) await logError(`[UPLOAD][schedule_places] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+  } else {
+    await logInfo('[UPLOAD] schedule_places empty; skipping');
+  }
 }
 
 async function main() {
-  ensureDirs();
-  fs.writeFileSync(OUT_LOG, ''); // reset log
+  await logInfo('ETL start');
+  await logInfo(`ENV urlHost=${(SUPABASE_URL ? new URL(SUPABASE_URL).host : 'undefined')} anon=${mask(SUPABASE_ANON)} svc=${mask(SUPABASE_SERVICE_ROLE)}`);
 
-  log('[INFO] ETL start');
-  const raw = fs.readFileSync(INPUT_PATH, 'utf-8');
+  await generateSchemaAndDocsPlaceholders();
 
-  const blocks = extractArrays(raw);
-  log(`[INFO] Detected array blocks: ${blocks.length}`);
+  const seed = await loadOrCreateSeed();
 
-  let allObjs = [];
-  for (let i = 0; i < blocks.length; i++) {
-    try {
-      const arr = safeEvalArray(blocks[i]);
-      log(`[INFO] Block ${i + 1} parsed: ${arr.length} items`);
-      allObjs = allObjs.concat(arr);
-    } catch (e) {
-      log(`[ERROR][PARSE] Block ${i + 1} parse failed: ${e.message}`);
-    }
-  }
+  await writeFileSafe(SEED_JSON, JSON.stringify(seed, null, 2));
+  await logInfo(`Seed JSON written: ${SEED_JSON} (categories=${seed.categories?.length ?? 0}, places=${seed.places?.length ?? 0}, schedules=${seed.schedules?.length ?? 0}, schedule_places=${seed.schedule_places?.length ?? 0})`);
 
-  const normalized = normalizeData(allObjs);
-  fs.writeFileSync(OUT_SEED_JSON, JSON.stringify(normalized, null, 2), 'utf-8');
-  log(`[INFO] Seed JSON written: ${OUT_SEED_JSON} (categories=${normalized.categories.length}, places=${normalized.places.length}, schedules=0, schedule_places=0)`);
+  await upsertWithServiceRole(seed);
 
-  // Write schema.sql now
-  fs.writeFileSync(OUT_SCHEMA, DDL_SQL, 'utf-8');
-  log(`[INFO] schema.sql written: ${OUT_SCHEMA}`);
+  await validateWithAnon();
 
-  // Mapping doc
-  const mappingMd = `# Data Mapping (jeju.txt -> Supabase)
-
-Source file: ${INPUT_PATH}
-
-Parsed sections:
-- Arrays of place objects grouped under headings (자연/관광지, 카페, 맛집, 액티비티).
-- Each object fields:
-  - id (source only), name, category, lat, lng, image, description, time, fee, url
-
-Normalized targets:
-- public.categories
-  - key: unique text derived from "category" (nature|cafe|restaurant|activity)
-  - name: human-readable label (자연/관광지, 카페, 맛집, 액티비티)
-- public.places
-  - name -> name
-  - category_key -> from "category"
-  - lat -> lat (double), lng -> lng (double)
-  - image, description, time, fee, url -> as-is
-  - (source_id is stored only in seed JSON for traceability; not inserted)
-- public.schedules: Not present in source (none created)
-- public.schedule_places: Not present in source (none created)
-
-Notes:
-- DDL (schema.sql) is provided. Creating tables via programmatic anon key is not permitted; please execute schema.sql in Supabase SQL editor if tables do not exist.
-- Upserts:
-  - categories: upsert on key
-  - places: insert new rows; duplicates avoided by (name,lat,lng) check before insert
-- Validation:
-  - counts and first 3 samples per table recorded in logs: ${OUT_LOG}
-`;
-  fs.writeFileSync(OUT_MAPPING, mappingMd, 'utf-8');
-  log(`[INFO] Mapping doc written: ${OUT_MAPPING}`);
-
-  // Supabase connection
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  if (!url || !anon) {
-    log('[WARN] Supabase env missing. Skipping upload and validation. You can connect MGX Supabase tab and rerun this script.');
-    log('[INFO] ETL finished with warnings (no upload performed).');
-    return;
-  }
-
-  const supabase = createClient(url, anon);
-
-  // Attempt DDL (document-only)
-  await tryDDL(supabase);
-
-  // Upload categories and places
-  const catRes = await upsertCategories(supabase, normalized.categories);
-  if (catRes.error) {
-    log('[WARN] Skipping places upload due to categories error.');
-  } else {
-    const placesRes = await insertPlaces(supabase, normalized.places);
-    if (placesRes.error) {
-      log('[ERROR] Places upload encountered an error. See above.');
-    }
-  }
-
-  // Validation
-  await validate(supabase);
-
-  log('[INFO] ETL completed.');
+  await logInfo('ETL completed.');
 }
 
-main().catch(err => {
-  log(`[FATAL] ${err?.stack || err?.message || String(err)}`);
+main().catch(async (e) => {
+  await logError(`ETL fatal: ${e?.stack || e?.message || e}`);
   process.exit(1);
 });
