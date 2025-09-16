@@ -20,9 +20,11 @@ jobs:
 
       - name: Install dependencies and build
         run: |
+          cd workspace/jeju-travel-planner
+          pwd
+          ls -la
           npm ci
           npm run export
-        working-directory: ./workspace/jeju-travel-planner
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
