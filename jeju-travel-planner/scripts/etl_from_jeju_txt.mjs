@@ -18,7 +18,10 @@ const LOG_PATH = path.resolve(LOG_DIR, 'etl_validation.log');
 // Env
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+// Support both service secret (preferred) and legacy service_role JWT (fallback)
+const SUPABASE_SERVICE_SECRET = process.env.SUPABASE_SERVICE_SECRET || '';
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
+const SUPABASE_SERVICE_KEY = SUPABASE_SERVICE_SECRET || SUPABASE_SERVICE_ROLE || '';
 const INSERT_ONLY = (() => {
   const v = String(process.env.ETL_INSERT_ONLY || '').toLowerCase();
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
@@ -109,6 +112,41 @@ async function loadOrCreateSeed() {
   return seed;
 }
 
+// Sanitize rows against known schema to avoid unknown-column errors (e.g., 'source_id')
+function pick(obj, keys) {
+  const out = {};
+  for (const k of keys) {
+    if (obj[k] !== undefined) out[k] = obj[k];
+  }
+  return out;
+}
+function toNumOrNull(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function sanitizeCategories(rows) {
+  const cols = ['key', 'name', 'id']; // allow id if present, though not required
+  return rows.map((r) => pick(r, cols));
+}
+function sanitizePlaces(rows) {
+  const cols = ['id','name','category_key','lat','lng','image','description','time','fee','url'];
+  return rows.map((r) => {
+    const o = pick(r, cols);
+    if ('lat' in o) o.lat = toNumOrNull(o.lat);
+    if ('lng' in o) o.lng = toNumOrNull(o.lng);
+    return o;
+  });
+}
+function sanitizeSchedules(rows) {
+  const cols = ['id','title','created_at'];
+  return rows.map((r) => pick(r, cols));
+}
+function sanitizeSchedulePlaces(rows) {
+  const cols = ['schedule_id','place_id','order_index','time_str'];
+  return rows.map((r) => pick(r, cols));
+}
+
 async function validateWithAnon() {
   const anon = supabaseClient(SUPABASE_ANON);
   if (!anon) {
@@ -156,18 +194,19 @@ async function validateWithAnon() {
 }
 
 async function upsertWithServiceRole(seed) {
-  const svc = supabaseClient(SUPABASE_SERVICE_ROLE);
+  const svc = supabaseClient(SUPABASE_SERVICE_KEY);
   if (!svc) {
-    await logError('SERVICE client not initialized. Ensure SUPABASE_SERVICE_ROLE and URL are set.');
+    await logError('SERVICE client not initialized. Ensure SUPABASE_SERVICE_SECRET (preferred) or SUPABASE_SERVICE_ROLE and URL are set.');
     return;
   }
   await logInfo(`[MODE] Insert-only = ${INSERT_ONLY ? 'ON' : 'OFF'}`);
-  await logInfo(`[UPLOAD] Using service role client (masked) urlHost=${(new URL(SUPABASE_URL)).host} svc=${mask(SUPABASE_SERVICE_ROLE)}`);
+  await logInfo(`[UPLOAD] Using service client (masked) urlHost=${(new URL(SUPABASE_URL)).host} svc=${mask(SUPABASE_SERVICE_KEY)}`);
 
-  const categories = Array.isArray(seed.categories) ? seed.categories : [];
-  const places = Array.isArray(seed.places) ? seed.places : [];
-  const schedules = Array.isArray(seed.schedules) ? seed.schedules : [];
-  const schedule_places = Array.isArray(seed.schedule_places) ? seed.schedule_places : [];
+  // Sanitize per table to match schema
+  const categories = sanitizeCategories(Array.isArray(seed.categories) ? seed.categories : []);
+  const places = sanitizePlaces(Array.isArray(seed.places) ? seed.places : []);
+  const schedules = sanitizeSchedules(Array.isArray(seed.schedules) ? seed.schedules : []);
+  const schedule_places = sanitizeSchedulePlaces(Array.isArray(seed.schedule_places) ? seed.schedule_places : []);
 
   await logInfo('[DDL] Skipped programmatic DDL. Apply schema/policies in Supabase Studio or via server.');
 
@@ -181,6 +220,7 @@ async function upsertWithServiceRole(seed) {
     }
     const { error, status } = resp;
     if (error) await logError(`[UPLOAD][categories] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo('[UPLOAD][categories] ok');
   } else {
     await logWarn('[UPLOAD] categories is empty; skipping');
   }
@@ -195,6 +235,7 @@ async function upsertWithServiceRole(seed) {
     }
     const { error, status } = resp;
     if (error) await logError(`[UPLOAD][places] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo('[UPLOAD][places] ok');
   } else {
     await logWarn('[UPLOAD] places is empty; skipping');
   }
@@ -203,6 +244,7 @@ async function upsertWithServiceRole(seed) {
     await logInfo(`[UPLOAD] Upserting schedules (${schedules.length})`);
     const { error, status } = await svc.from('schedules').upsert(schedules, { ignoreDuplicates: INSERT_ONLY });
     if (error) await logError(`[UPLOAD][schedules] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo('[UPLOAD][schedules] ok');
   } else {
     await logInfo('[UPLOAD] schedules empty; skipping');
   }
@@ -211,6 +253,7 @@ async function upsertWithServiceRole(seed) {
     await logInfo(`[UPLOAD] Upserting schedule_places (${schedule_places.length})`);
     const { error, status } = await svc.from('schedule_places').upsert(schedule_places, { ignoreDuplicates: INSERT_ONLY });
     if (error) await logError(`[UPLOAD][schedule_places] status=${status} code=${error.code ?? ''} msg=${error.message ?? ''}`);
+    else await logInfo('[UPLOAD][schedule_places] ok');
   } else {
     await logInfo('[UPLOAD] schedule_places empty; skipping');
   }
@@ -218,7 +261,7 @@ async function upsertWithServiceRole(seed) {
 
 async function main() {
   await logInfo('ETL start');
-  await logInfo(`ENV urlHost=${(SUPABASE_URL ? new URL(SUPABASE_URL).host : 'undefined')} anon=${mask(SUPABASE_ANON)} svc=${mask(SUPABASE_SERVICE_ROLE)}`);
+  await logInfo(`ENV urlHost=${(SUPABASE_URL ? new URL(SUPABASE_URL).host : 'undefined')} anon=${mask(SUPABASE_ANON)} svc=${mask(SUPABASE_SERVICE_KEY)}`);
 
   await generateSchemaAndDocsPlaceholders();
 
