@@ -12,6 +12,46 @@ A Next.js app integrated with Supabase to explore Jeju travel places and categor
   - npm run build
   - npm start
 
+## GitHub Pages 배포
+
+이 프로젝트는 GitHub Pages를 통해 자동으로 배포됩니다.
+
+### 자동 배포 설정
+
+1. **GitHub Pages 활성화**
+   - GitHub 저장소 → Settings → Pages
+   - Source: "GitHub Actions" 선택
+
+2. **환경 변수 설정**
+   - GitHub 저장소 → Settings → Secrets and variables → Actions
+   - 다음 시크릿 추가 (필요시):
+     - `SUPABASE_URL`: Supabase 프로젝트 URL
+     - `SUPABASE_ANON_KEY`: Supabase 익명 키
+
+3. **배포 실행**
+   - 코드를 `master` 브랜치에 push하면 자동으로 배포됩니다
+   - 또는 수동으로 Actions 탭에서 "Deploy to GitHub Pages" 워크플로우 실행
+
+### 로컬 테스트
+
+```bash
+# GitHub Pages용 빌드 테스트
+npm run export
+
+# 빌드 결과 확인
+ls -la out/
+```
+
+### 배포 URL
+
+배포 완료 후: `https://minryu87.github.io/jeju/`
+
+### 주의사항
+
+- GitHub Pages는 정적 파일만 지원하므로 Next.js의 서버 사이드 기능은 제한적입니다
+- API Routes는 사용할 수 없습니다
+- 동적 라우팅은 작동하지 않을 수 있습니다
+
 ## Environment Variables
 
 Create `.env.local` at project root:
