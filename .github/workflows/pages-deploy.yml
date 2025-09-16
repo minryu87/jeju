@@ -18,18 +18,11 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Change to project directory
-        run: cd workspace/jeju-travel-planner
-
-      - name: Install dependencies
+      - name: Install dependencies and build
         run: |
-          cd workspace/jeju-travel-planner
           npm ci
-
-      - name: Build Next.js
-        run: |
-          cd workspace/jeju-travel-planner
           npm run export
+        working-directory: ./workspace/jeju-travel-planner
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
